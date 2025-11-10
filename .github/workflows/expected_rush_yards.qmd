@@ -1,0 +1,445 @@
+---
+title: "Expected Rush Yards"
+author: "Lucca Ferraz, Savan Patel, Ryan Coombs, Peyton Stevenson"
+format: 
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+cache: true
+---
+
+## Read in Data
+
+```{r}
+# loading in data and libraries
+library(tidyverse)
+library(janitor)
+train_data <- read_csv("train_data.csv")
+test_data <- read_csv("test_data.csv")
+submission_sample <- read_csv("submission_sample.csv")
+```
+
+## Cleaning Data
+
+The first step in our process was to standardize coordinates so all players are moving from left to right, as well as identifying the rusher, which team was on offense, and how many yards away from the end zone the offense is.
+
+```{r}
+clean_data <- train_data |> 
+  clean_names() |> 
+  rename(o = orientation) |> 
+  mutate(
+    # make all plays go from left to right
+    x = ifelse(play_direction == "left", 120 - x, x),
+    y = ifelse(play_direction == "left", 160 / 3 - y, y),
+    # flip player direction and orientation
+    dir = ifelse(play_direction == "left", dir + 180, dir),
+    dir = ifelse(dir > 360, dir - 360, dir),
+    o = ifelse(play_direction == "left", o + 180, o),
+    o = ifelse(o > 360, o - 360, o)
+  ) |> 
+  mutate(is_rusher = ifelse(nfl_id == nfl_id_rusher, 1, 0), # identify rushers
+         yards_from_home = ifelse(possession_team == field_position, yard_line , 50 + (50 - yard_line)), # Yards from own goal if PossessionTeam==FieldPosition
+         offense_team = ifelse(possession_team == home_team_abbr, 'home', 'away'), # home or away team on offense if PossessionTeam == HomeTeamAbbr
+         offense = ifelse(team == offense_team,1,0), # offensive team or defensive team if team == TeamOffense
+         yards_to_td = 100 - yards_from_home, # calculate yards to go
+  ) |> 
+  mutate(x_end = 2*sin(dir*pi/180) + x,
+         y_end = 2*cos(dir*pi/180) + y)
+```
+
+## Feature Engineering
+
+For the purposes of our model, we engineer various different features. We keep game context variables such as score differential, down and distance, quarter, and offensive/defensive formations/personnel. We also keep features describing the rusher, such as their location, speed, acceleration, and orientation. We devise defender features describing how close the closest defender is, how far the farthest defender is, as well as how far the 25th, 50th, and 75th percentile distance defenders are from the ballcarrier. We also compute how many defenders are "ahead" of the ball, by measuring how many defensive players there are within a 30 degree cone formed from the ball carriers' direction. Once we have that, we measure how close the closest player within the "cone" is, as well as how far the farthest is. We then compute blocking features (how many blockers, how close they are to the ballcarrier, how far apart horizontally and vertically they are to each other). Lastly, we compute convex hull features, such as the total area the offense occupies (calculated using the shoelace formula with the different players as coordinates), as well as the defensive area (calculated the same way). We take these features both for the entire field as well as for the 30 degree cone ahead of the ballcarrier.
+
+```{r, warning = FALSE}
+# helper to compute polygon area (useful for features of space control by offense and defense)
+poly_area <- function(x, y) {
+  if(length(x) < 3) return(NA_real_) # need at least 3 points
+  # order points by convex hull
+  hull_idx <- chull(x, y)
+  x_h <- x[hull_idx]
+  y_h <- y[hull_idx]
+  # shoelace formula
+  0.5 * abs(sum(x_h * dplyr::lead(y_h, default = y_h[1])) -
+              sum(y_h * dplyr::lead(x_h, default = x_h[1])))
+}
+
+# function to compute all features given the play frame
+make_features <- function(play_frame) {
+  # play_frame: one tibble of all players at handoff for a single play
+  # identify who the rusher is
+  rusher_id <- unique(play_frame$nfl_id_rusher)
+  rusher <- play_frame |> filter(nfl_id == rusher_id)
+  
+  # game context features
+  context_feats <- tibble(
+    game_id = play_frame$game_id[1],
+    id = play_frame$id[1],            # take first row safely
+    down = play_frame$down[1],
+    distance = play_frame$distance[1],
+    yard_line = play_frame$yard_line[1],
+    quarter = play_frame$quarter[1],
+    home_score_before_play = play_frame$home_score_before_play[1],
+    visitor_score_before_play = play_frame$visitor_score_before_play[1],
+    defenders_in_the_box = play_frame$defenders_in_the_box[1],
+    offense_formation = play_frame$offense_formation[1],
+    offense_personnel = play_frame$offense_personnel[1],
+    defense_personnel = play_frame$defense_personnel[1],
+    score_diff = play_frame$home_score_before_play[1] - play_frame$visitor_score_before_play[1]
+  )
+  
+  # rusher features
+  rusher_feats <- tibble(
+    rusher_x = rusher$x[1],
+    rusher_y = rusher$y[1],
+    rusher_speed = rusher$s[1],
+    rusher_accel = rusher$a[1],
+    rusher_orientation = rusher$o[1],
+    rusher_dir = rusher$dir[1],
+    rusher_yardline_dist = rusher$yard_line[1] - rusher$x[1]
+  )
+  
+  # defender features
+  defenders <- play_frame |> filter(team != rusher$team)
+  
+  defenders <- defenders |> 
+    mutate(dx = x - rusher$x,
+           dy = y - rusher$y,
+           dist = sqrt(dx^2 + dy^2),
+           angle = atan2(dy, dx) * 180/pi)
+  
+  # nearest defender distances
+  nearest <- defenders |> 
+    summarise(min_defender_dist = min(dist),
+              mean_defender_dist = mean(dist),
+              dist_25 = quantile(dist, 0.25),
+              dist_50 = quantile(dist, 0.50),
+              dist_75 = quantile(dist, 0.75))
+  
+  # defenders ahead of rusher (within ±30° cone)
+  defenders_ahead <- defenders |> 
+    filter(dx > 0, abs(angle) < 30)
+  
+  cone_feats <- defenders_ahead |> 
+    summarise(cone_min_dist = min(dist, na.rm = TRUE),
+              cone_mean_dist = mean(dist, na.rm = TRUE),
+              cone_count = n())
+  
+  # blocker features (use OL only for simplicity)
+  blockers <- play_frame |> 
+    filter(team == rusher$team,
+           position %in% c("C","G","T","OT","OG","LT","RT","LG","RG")) |> 
+    mutate(dx = x - rusher$x,
+           dy = y - rusher$y,
+           dist = sqrt(dx^2 + dy^2))
+  
+  if(nrow(blockers) > 0) {
+    blocker_feats <- blockers |> 
+      summarise(
+        num_blockers = n(), # how many blockers
+        mean_blocker_dist = mean(dist), # avg distance of blocker to rusher
+        min_blocker_dist = min(dist), # closest distance of blocker to rusher
+        max_blocker_dist = max(dist), # farthest distance of blocker to rusher
+        line_width = max(y) - min(y),   # spread of OL horizontally
+        line_depth = max(x) - min(x),   # how deep OL is relative to LOS
+        avg_blocker_orientation = mean(o, na.rm = TRUE) # avg blocker direction
+      )
+  } else {
+    blocker_feats <- tibble(
+      num_blockers = 0,
+      mean_blocker_dist = NA,
+      min_blocker_dist = NA,
+      max_blocker_dist = NA,
+      line_width = NA,
+      line_depth = NA,
+      avg_blocker_orientation = NA
+    )
+  }
+  # convex hull features
+  offense <- play_frame |> filter(team == rusher$team)
+  defense <- play_frame |> filter(team != rusher$team)
+  
+  offense_area <- poly_area(offense$x, offense$y)
+  defense_area <- poly_area(defense$x, defense$y)
+  
+  hull_feats <- tibble(
+    offense_hull_area = offense_area,
+    defense_hull_area = defense_area,
+    hull_area_ratio = offense_area / defense_area 
+  )
+  # convex hull features in rushers' forward cone
+  # forward cone defined by dx > 0 and abs(angle) < 30°
+  offense_cone <- offense |> 
+    mutate(dx = x - rusher$x,
+           dy = y - rusher$y,
+           angle = atan2(dy, dx) * 180/pi) |> 
+    filter(dx > 0, abs(angle) < 30)
+  
+  defense_cone <- defenders_ahead # already filtered
+  
+  offense_cone_area <- poly_area(offense_cone$x, offense_cone$y)
+  defense_cone_area <- poly_area(defense_cone$x, defense_cone$y)
+  
+  cone_hull_feats <- tibble(
+    offense_cone_area = offense_cone_area,
+    defense_cone_area = defense_cone_area,
+    cone_area_ratio = offense_cone_area / defense_cone_area
+  )
+  # combine all features
+  bind_cols(context_feats, rusher_feats, blocker_feats, nearest, cone_feats, 
+            hull_feats, cone_hull_feats)
+}
+
+# calculate features for every play
+all_features <- clean_data |> 
+  group_by(id) |> 
+  group_modify(~ make_features(.x)) |> 
+  ungroup()
+
+target_variable <- clean_data |> 
+  group_by(id) |> 
+  summarise(yards = first(yards))
+
+# go from -99:99 to 0:198 because xgboost models only accept labels from 0 to number of classes minus 1
+target_numeric <- as.numeric(target_variable$yards) + 99
+
+nclass <- 199
+
+# fill NA and infinite values with 0
+all_features <- all_features |> 
+  mutate(offense_cone_area = ifelse(is.na(offense_cone_area), 0, offense_cone_area),
+         cone_area_ratio = ifelse(is.na(cone_area_ratio), 0, cone_area_ratio),
+         defense_cone_area = ifelse(is.na(defense_cone_area), 0, defense_cone_area),
+         offense_formation = ifelse(is.na(offense_formation), "UNKNOWN", offense_formation),
+         defenders_in_the_box = ifelse(is.na(defenders_in_the_box), 0, defenders_in_the_box),
+         cone_mean_dist = ifelse(is.na(cone_mean_dist), 0, cone_mean_dist),
+         cone_min_dist = ifelse(is.infinite(cone_min_dist), 0, cone_min_dist)) |> 
+  select(-game_id, -home_score_before_play, -visitor_score_before_play) |> # unhelpful variables
+  mutate(down = as.factor(down),
+         quarter = as.factor(quarter)) # convert to factor
+
+model_features <- all_features |> 
+  select(-id) # do not want the model to overfit to play id's
+```
+
+## Modeling
+
+For our model we use an XGBoost. This allows us to capture complex non-linear linteractions between our features while also optimizing for prediction accuracy. To tune the hyperparameters, we apply a grid search and use 5-fold cross-validation to test which hyperparameters work best.
+```{r}
+#| eval: false
+# Identify categorical columns
+cat_cols <- sapply(model_features, function(x) is.factor(x) || is.character(x))
+
+# turn categorical columns into factors
+model_features[cat_cols] <- lapply(model_features[cat_cols], factor)
+# save factor levels to ensure matches with test data
+factor_levels <- lapply(model_features[cat_cols], levels)
+
+# one-hot encoding for categorical variables
+encoded_features <- model.matrix(~ ., data = model_features[, cat_cols])
+
+# combine with numeric features
+numeric_features <- model_features[, !cat_cols]
+final_features <- cbind(numeric_features, encoded_features)
+
+# remove intercept column as well as target variable
+final_features <- final_features[, !colnames(final_features) %in% c("(Intercept)", "yards")]
+
+# define evaluation metric, the Continuous Ranked Probability Score (CRPS)
+crps =  function(preds, dtrain,raw_prob=F) {
+  labels <- getinfo(dtrain, "label")
+  n_samples <- length(labels)
+  preds_matrix <- matrix(preds, nrow = n_samples, byrow = TRUE)
+  
+  # if preds is not raw probabilities, use softmax to convert them to raw probabilities.
+  if (raw_prob == F) {
+    # Apply softmax to each row
+    softmax <- function(x) exp(x) / sum(exp(x))
+    preds_prob <- t(apply(preds_matrix, 1, softmax))
+    
+  } else {
+    
+    preds_prob = preds_matrix
+    
+  }
+  
+  crps_sum <- 0
+  # calculate crps scores
+  for (i in 1:n_samples) {
+    y <- labels[i] - 99  # Convert back to -99 to 99 range
+    p <- cumsum(preds_prob[i, ])  # Cumulative probabilities
+    
+    # print (preds_prob[i, ])
+    crps_sample <- sum((p - (y <= (-99:99)))^2) / 199
+    crps_sum <- crps_sum + crps_sample
+  }
+  
+  crps <- crps_sum / n_samples
+  return(list(metric = "crps", value = crps))
+}
+
+# for cross-validation, take only first 500 rows for quicker runtime 
+dtrain <- xgb.DMatrix(data = as.matrix(final_features)[1:500,], label = target_numeric[1:500])
+
+
+# parameter grid for tuning
+grid <- expand.grid(
+  nrounds = seq(100, 200, 10),
+  eta = c(0.05, 0.1, 0.2),
+  max_depth = c(4, 5, 6)
+)
+
+results <- list()
+
+# for all possible hyperparameter combos, train model using cross-validation and report test error
+# this cross-validation takes over 3 hours to run
+for (i in 1:nrow(grid)) {
+  params <- list(
+    objective = "multi:softprob",
+    num_class = nclass,
+    eta = grid$eta[i],
+    max_depth = grid$max_depth[i]
+  )
+  
+  cv <- xgb.cv(data = dtrain,
+               nrounds = grid$nrounds[i],
+               eta = grid$eta[i],
+               max_depth = grid$max_depth[i],
+               # verbose = FALSE,
+               num_class = nclass,
+               eval_metric = crps,
+               early_stopping_rounds = 20,
+               maximize = FALSE,
+               nfold = 5,
+               objective = 'multi:softprob'
+               
+  )
+  
+  results[[i]] <- data.frame(
+    nrounds = grid$nrounds[i],
+    eta = grid$eta[i],
+    max_depth = grid$max_depth[i],
+    best_iter = cv$best_iteration,
+    best_score = min(cv$evaluation_log$test_crps_mean, na.rm = TRUE)
+  )
+}
+
+# get results
+results_df <- do.call(rbind, results)
+
+# best parameters
+best <- results_df[which.min(results_df$best_score), ]
+
+# now we can train model using all data
+dtrain <- xgb.DMatrix(data = as.matrix(final_features), label = target_numeric)
+
+# train model using best hyperparameters (this also takes over an hour)
+xg_model <- xgboost(data = dtrain,
+                    nrounds = best$nrounds,
+                    eta = best$eta,
+                    max_depth = best$max_depth,
+                    # verbose = FALSE,
+                    num_class = nclass,
+                    eval_metric = crps,
+                    # nfold = 5,
+                    objective = 'multi:softprob'
+                    )
+
+# see most important features
+library(vip)
+vip(xg_model, num_features = 100)
+```
+
+## Apply Model to Test Data
+
+```{r}
+#| eval: false
+# clean test data same way as train
+clean_test_data <- test_data |> 
+  clean_names() |> 
+  rename(o = orientation) |> 
+  mutate(
+    # make all plays go from left to right
+    x = ifelse(play_direction == "left", 120 - x, x),
+    y = ifelse(play_direction == "left", 160 / 3 - y, y),
+    # flip player direction and orientation
+    dir = ifelse(play_direction == "left", dir + 180, dir),
+    dir = ifelse(dir > 360, dir - 360, dir),
+    o = ifelse(play_direction == "left", o + 180, o),
+    o = ifelse(o > 360, o - 360, o)
+  ) |> 
+  mutate(is_rusher = ifelse(nfl_id == nfl_id_rusher, 1, 0), # identify rushers
+         yards_from_home = ifelse(possession_team == field_position, yard_line , 50 + (50 - yard_line)), # Yards from own goal if PossessionTeam==FieldPosition
+         offense_team = ifelse(possession_team == home_team_abbr, 'home', 'away'), # home or away team on offense if PossessionTeam == HomeTeamAbbr
+         offense = ifelse(team == offense_team,1,0), # offensive team or defensive team if team == TeamOffense
+         yards_to_td = 100 - yards_from_home, # calculate yards to go
+  ) |> 
+  mutate(x_end = 2*sin(dir*pi/180) + x,
+         y_end = 2*cos(dir*pi/180) + y)
+
+# compute features for test data
+all_test_features <- clean_test_data |> 
+  group_by(id) |> 
+  group_modify(~ make_features(.x)) |> 
+  ungroup()
+
+# fill in NA and infinite values
+all_test_features <- all_test_features |> 
+  mutate(offense_cone_area = ifelse(is.na(offense_cone_area), 0, offense_cone_area),
+         cone_area_ratio = ifelse(is.na(cone_area_ratio), 0, cone_area_ratio),
+         defense_cone_area = ifelse(is.na(defense_cone_area), 0, defense_cone_area),
+         offense_formation = ifelse(is.na(offense_formation), "UNKNOWN", offense_formation),
+         defenders_in_the_box = ifelse(is.na(defenders_in_the_box), 0, defenders_in_the_box),
+         cone_mean_dist = ifelse(is.na(cone_mean_dist), 0, cone_mean_dist),
+         cone_min_dist = ifelse(is.infinite(cone_min_dist), 0, cone_min_dist)) |> 
+  select(-game_id, -home_score_before_play, -visitor_score_before_play) |> 
+  mutate(down = as.factor(down),
+         quarter = as.factor(quarter)) # change down and quarter to factors
+
+model_test_features <- all_test_features |> 
+  select(-id) # remove play id
+
+# identify categorical columns
+cat_cols_test <- sapply(model_test_features, function(x) is.factor(x) || is.character(x))
+
+# force same factor levels as train (test data does not contain all formations seen in train)
+for (col in names(factor_levels)) {
+  # set factor levels
+  model_test_features[[col]] <- factor(model_test_features[[col]],
+                                       levels = factor_levels[[col]])
+  # replace NAs (unseen levels) with first level or baseline
+  model_test_features[[col]][is.na(model_test_features[[col]])] <- levels(model_test_features[[col]])[1]
+}
+
+
+# one-hot encoding for categorical variables
+encoded_test_features <- model.matrix(~ .,
+                                      data = model_test_features[, names(factor_levels)])
+
+# combine with numeric features
+numeric_test_features <- model_test_features[, !cat_cols_test]
+final_test_features <- cbind(numeric_test_features, encoded_test_features)
+
+# remove intercept column
+final_test_features <- final_test_features[, !colnames(final_test_features) %in% c("(Intercept)", "yards")]
+
+# get xgboost matrix for predictions
+dtest <- xgb.DMatrix(data = as.matrix(final_test_features))
+
+# make predictions
+df_predict <- predict(xg_model, dtest)
+
+# change to matrix
+matrix_predict <- matrix(df_predict, nrow = nrow(as.matrix(final_test_features)), byrow = TRUE)
+
+matrix_predict_cumsum <- t(apply(matrix_predict,1,cumsum)) # calculate cumulative probability
+
+# create submission file in same format as example
+submission_file <- cbind(data.frame(ID = unique(test_data$ID)),matrix_predict_cumsum)
+colnames(submission_file)[2:ncol(submission_file)]= paste0('Yards',-99:99)
+
+# write_csv(submission_file, "submission_file.csv") write to csv
+```
